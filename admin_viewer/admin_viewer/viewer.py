@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os, json, platform, shutil, webbrowser
 from datetime import datetime
+import hashlib
 import pandas as pd
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -9,8 +10,10 @@ import tkinter.font as tkfont
 from .version import __version__
 from .config import APP_TITLE, CACHE_DIR, SETTINGS_PATH, DEFAULT_VIEW_COLS, HEADER_LABELS
 from .helpers import autosize_excel, parse_id_list, sanitize_component, is_url
-from .drive import drive_download_url, extract_drive_file_id
 from . import ui
+from .ui_progress import parse_with_popup
+from .parser_runner import load_manifest  # 매니페스트 선확인용
+
 
 class ViewerApp(tk.Tk):
     def __init__(self):
@@ -36,27 +39,90 @@ class ViewerApp(tk.Tk):
         self._overlay_font = None
         self._overlay_url = None
 
+        # 엑셀 저장 버튼 옆 '제공 기간' 라벨
+        self.lbl_range_var = tk.StringVar(value="")
+        self.lbl_range = None
+        # 파싱 시 제공된 기간 저장(조회 시 건수만 덧붙임)
+        self._provided_range = ("", "")  # (start_txt, end_txt)
+
         os.makedirs(CACHE_DIR, exist_ok=True)
         self._load_settings()
 
+        # UI 생성 (self.tree, self.status, self.combo, self.combo_var, self.btn_export, self.toolbar 등)
         ui.build_ui(self)
 
+        # 업체 선택 전 접근 방지: 엑셀 비활성화
+        try:
+            self.btn_export.configure(state="disabled")
+        except Exception:
+            pass
+
+        # 툴바에 '제공' 라벨 부착
+        self._init_range_label()
+
+    # ---------- settings ----------
     def _load_settings(self):
         try:
             if os.path.isfile(SETTINGS_PATH):
                 with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                 self.api_input.set(cfg.get("last_api", ""))
+                self._last_sig = cfg.get("last_manifest_sig", "")
         except:
-            pass
+            self._last_sig = ""
 
     def _save_settings(self):
         try:
+            cfg = {
+                "last_api": self.api_input.get().strip(),
+                "last_manifest_sig": getattr(self, "_last_sig", "")
+            }
             with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump({"last_api": self.api_input.get().strip()}, f, ensure_ascii=False, indent=2)
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
         except:
             pass
 
+    # ---------- 엑셀 옆 '제공' 라벨 ----------
+    def _init_range_label(self):
+        try:
+            parent = getattr(self, "toolbar", None)
+            if parent is None:
+                return
+            if self.lbl_range is None:
+                self.lbl_range = ttk.Label(parent, textvariable=self.lbl_range_var)
+                self.lbl_range.pack(side="left", padx=(6, 0))
+        except Exception:
+            pass
+
+    def _update_range_label(self, s_txt: str, e_txt: str, count: int | None = None):
+        """
+        파싱 직후: count=None → '제공: 시작 ~ 종료'만
+        조회 후: count=int → '제공: … / N건'
+        """
+        text = ""
+        if s_txt or e_txt:
+            text = f"제공: {s_txt} ~ {e_txt}" if (s_txt and e_txt) else f"제공: {s_txt or e_txt}"
+        if count is not None:
+            text = (text + " / " if text else "") + f"{count:,}건"
+        try:
+            self.lbl_range_var.set(text)
+            if self.lbl_range is None:
+                self._init_range_label()
+        except Exception:
+            pass
+
+    # ---------- 콤보 완전 비활성화 ----------
+    def _disable_combo(self):
+        """콤보를 완전 비활성화 + 목록 숨김 + 선택값 비움."""
+        self.combo_items = []
+        self.combo_map = {}
+        try:
+            self.combo.configure(state="disabled", values=[])
+        except Exception:
+            pass
+        self.combo_var.set("")
+
+    # ---------- API 입력 받고 실행 ----------
     def _prompt_api_then_sync(self):
         initial = self.api_input.get().strip()
         val = simpledialog.askstring(
@@ -71,90 +137,130 @@ class ViewerApp(tk.Tk):
         self._save_settings()
         self.sync_data()
 
+    # ---------- 파싱 실행 ----------
     def sync_data(self):
-        import requests
-        raw = self.api_input.get().strip()
-        if not raw:
-            messagebox.showwarning("경고", "API 또는 manifest 파일 ID/공유링크를 입력하세요.")
+        manifest_src = self.api_input.get().strip()
+        if not manifest_src:
+            messagebox.showwarning("경고", "API 또는 manifest 파일 ID/공유링크를 입력하세요.", parent=self)
             return
+
+        # 0) 매니페스트 선확인
         try:
-            manifest = None
-            if is_url(raw):
-                fid = extract_drive_file_id(raw)
-                if fid:
-                    manifest = requests.get(drive_download_url(fid), timeout=60).json()
-                else:
-                    resp = requests.get(raw, timeout=60)
-                    resp.raise_for_status()
-                    payload = resp.json()
-                    if isinstance(payload, dict) and "files" in payload:
-                        manifest = payload
-                    else:
-                        mid = self._extract_manifest_id(payload)
-                        if not mid:
-                            raise ValueError("API 응답에서 manifest_file_id를 찾지 못했습니다.")
-                        manifest = requests.get(drive_download_url(mid), timeout=60).json()
-            else:
-                manifest = requests.get(drive_download_url(raw), timeout=60).json()
+            manifest = load_manifest(manifest_src)
+            new_sig = self._signature_of_manifest(manifest)
         except Exception as e:
-            messagebox.showerror("에러", f"API 호출 실패\n{e}")
+            messagebox.showerror("에러", f"매니페스트 로드 실패: {e}", parent=self)
             return
 
-        files = manifest.get("files", []) if isinstance(manifest, dict) else []
-        if not files:
-            messagebox.showwarning("경고","manifest에 files가 없습니다.")
+        # 변경 없음 → 팝업 없이 상태만 갱신
+        if self._last_sig and new_sig == self._last_sig:
+            if self.df_all.empty:
+                parse_with_popup(self, manifest_src, on_done=self._after_parse, show_result=False)
+            else:
+                vr = manifest.get("view_range", {}) or {}
+                s_txt = (vr.get("min_date") or "").strip()
+                e_txt = (vr.get("max_date") or "").strip()
+                self._provided_range = (s_txt, e_txt)
+                self._update_range_label(s_txt, e_txt)  # 총량 감춤
+                if s_txt or e_txt:
+                    self.status.set(f"변경 없음: 기간 {s_txt} ~ {e_txt}")
+                else:
+                    self.status.set("변경 없음")
             return
 
-        frames=[]
-        for f in files:
-            fid = f.get("fileId"); name = f.get("name")
-            if not fid or not name:
-                continue
-            try:
-                local_path = os.path.join(CACHE_DIR, name)
-                r = requests.get(drive_download_url(fid), timeout=120)
-                r.raise_for_status()
-                with open(local_path, "wb") as fp:
-                    fp.write(r.content)
-                frames.append(pd.read_parquet(local_path))
-            except Exception as e:
-                messagebox.showwarning("알림", f"{name} 받기 실패: {e}")
+        # 1) 변경 있음 → 진행 팝업(결과 팝업 없음)
+        parse_with_popup(self, manifest_src, on_done=self._after_parse, show_result=False)
 
-        if not frames:
-            messagebox.showwarning("경고","가져온 데이터가 없습니다.")
-            return
+    def _signature_of_manifest(self, manifest: dict) -> str:
+        """manifest 핵심 값(version, schema, files[name/size/fileId])으로 해시 생성"""
+        try:
+            ver = str(manifest.get("version", ""))
+            sch = str(manifest.get("schema", ""))
+            files = manifest.get("files", []) or []
+            core = {
+                "version": ver,
+                "schema": sch,
+                "files": [
+                    {"name": f.get("name", ""),
+                     "size": int(f.get("size") or 0),
+                     "fileId": f.get("fileId", "")}
+                    for f in files
+                ]
+            }
+            dump = json.dumps(core, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            return hashlib.sha256(dump).hexdigest()
+        except Exception:
+            return ""
 
-        df = pd.concat(frames, ignore_index=True)
-        if "pub_date" in df.columns:
-            df["pub_date"] = pd.to_datetime(df["pub_date"], errors="coerce")
-
+    def _after_parse(self, res):
+        """
+        parse_with_popup 의 on_done 콜백.
+        res: ParseResult(df, start_date, end_date, meta)
+        """
+        # 1) DataFrame 반영
+        df = res.df.copy()
         view_cols = [c for c in DEFAULT_VIEW_COLS if c in df.columns]
-        self.df_all = df[view_cols].copy()
+        self.df_all = df[view_cols].copy() if view_cols else df.copy()
 
+        # 2) 상태 초기화 (테이블 비우기, 엑셀 비활성화, 콤보 비활성화)
         self.render_table(pd.DataFrame())
         self.last_filtered = pd.DataFrame()
         self.selected_ids.clear()
         self.last_ids = set()
         self.last_sdt = None
         self.last_edt = None
-        self._reset_combo()
+        self._disable_combo()
+        try:
+            self.btn_export.configure(state="disabled")
+        except Exception:
+            pass
 
-        vr = manifest.get("view_range", {})
-        self.status.set(f"동기화 완료: 기간 {vr.get('min_date')} ~ {vr.get('max_date')}")
+        # 3) 콤보 목록만 내부에 준비(화면은 비활성화 상태 유지)
+        if "place_id" in self.df_all.columns:
+            all_ids = [str(x) for x in self.df_all["place_id"].astype(str).dropna().unique()]
+            items, mapping = [], {}
+            if "company_name" in self.df_all.columns:
+                tmp = (self.df_all[["place_id","company_name"]]
+                       .dropna()
+                       .astype({"place_id": str, "company_name": str})
+                       .drop_duplicates(subset=["place_id"]))
+                for pid, cname in tmp.itertuples(index=False):
+                    label = f"{pid} - {cname}"
+                    items.append(label); mapping[label] = str(pid)
+            else:
+                for pid in all_ids:
+                    items.append(pid); mapping[pid] = pid
+            self.combo_items = items
+            self.combo_map = mapping
+            self.status.set("동기화 완료: 업체ID를 선택/등록하기 전에는 데이터를 표시하지 않습니다.")
+        else:
+            self.status.set("동기화 완료: place_id 컬럼이 없어 업체 선택 기능을 사용할 수 없습니다.")
 
-    def _extract_manifest_id(self, payload: dict):
-        if not isinstance(payload, dict):
-            return None
-        for k in ("manifest_file_id", "manifest_id", "file_id", "id"):
-            if isinstance(payload.get(k), str) and payload[k].strip():
-                return payload[k].strip()
-        data = payload.get("data", {})
-        if isinstance(data, dict):
-            for k in ("manifest_file_id", "manifest_id", "file_id", "id"):
-                if isinstance(data.get(k), str) and data[k].strip():
-                    return data[k].strip()
-        return None
+        # 4) 엑셀 옆 라벨에 '제공: 시작 ~ 종료'만 표시(총량 감춤)
+        s_txt = (res.start_date or "").strip() if res else ""
+        e_txt = (res.end_date or "").strip() if res else ""
+        if not (s_txt or e_txt) and "pub_date" in self.df_all.columns:
+            try:
+                p = pd.to_datetime(self.df_all["pub_date"], errors="coerce")
+                if not p.isna().all():
+                    s = p.min(); e = p.max()
+                    s_txt = s.strftime("%Y-%m-%d"); e_txt = e.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        self._provided_range = (s_txt, e_txt)
+        self._update_range_label(s_txt, e_txt)  # count 없이 호출
+        if s_txt or e_txt:
+            self.status.set(f"동기화 완료: 기간 {s_txt} ~ {e_txt}")
 
+        # 5) manifest 서명 저장(다음 비교용)
+        self._last_sig = self._signature_of_manifest({
+            "version": res.meta.get("version"),
+            "schema": res.meta.get("schema"),
+            "files": [{"name":"", "size": res.meta.get("total_size") or 0, "fileId": ""}]
+        }) or self._last_sig
+        self._save_settings()
+
+    # ---------- 표 렌더/정렬/필터 ----------
     def render_table(self, df: pd.DataFrame):
         self.tree.delete(*self.tree.get_children())
         self._hide_overlay()
@@ -225,7 +331,7 @@ class ViewerApp(tk.Tk):
             return
         ids = parse_id_list(txt)
         if not ids:
-            messagebox.showwarning("경고", "인식된 업체ID가 없습니다.")
+            messagebox.showwarning("경고", "인식된 업체ID가 없습니다.", parent=self)
             return
         self.selected_ids = ids
 
@@ -235,8 +341,7 @@ class ViewerApp(tk.Tk):
 
         df_ids = self.df_all[self.df_all["place_id"].astype(str).isin(ids)].copy()
         if "company_name" in df_ids.columns:
-            items = ["전체(선택된)"]
-            mapping = {}
+            items = ["전체(선택된)"]; mapping = {}
             for pid, cname in (
                 df_ids[["place_id","company_name"]]
                 .dropna()
@@ -296,12 +401,16 @@ class ViewerApp(tk.Tk):
             pass
 
         if not ids:
+            # ID 없으면 접근 불가: 표시/엑셀 모두 비활성
             self.last_filtered = pd.DataFrame()
-            self.last_ids = set()
-            self.last_sdt = sdt
-            self.last_edt = edt
             self.render_table(self.last_filtered)
-            self.status.set("업체 ID를 지정해야 조회할 수 있습니다.")
+            self.status.set("조회: 업체ID 미지정 — 데이터를 표시하지 않습니다.")
+            try:
+                self.btn_export.configure(state="disabled")
+            except Exception:
+                pass
+            # 라벨은 제공기간만 유지(건수 미표시)
+            self._update_range_label(*self._provided_range)
             return
 
         df = df[df["place_id"].astype(str).isin(ids)]
@@ -317,17 +426,25 @@ class ViewerApp(tk.Tk):
         self.last_edt = edt
         self.render_table(df)
 
+        # 엑셀 활성화 + 라벨에 '… / N건' 추가
+        try:
+            self.btn_export.configure(state="normal")
+        except Exception:
+            pass
+        self._update_range_label(*self._provided_range, count=len(df))
+
         range_txt = ""
         if sdt or edt:
             s_txt = sdt.strftime("%Y-%m-%d") if sdt else "…"
             e_txt = edt.strftime("%Y-%m-%d") if edt else "…"
             range_txt = f" / 기간 {s_txt} ~ {e_txt}"
-        ids_txt = f" / 업체ID {', '.join(sorted(map(str, ids)))[:80]}..." if ids else ""
+        ids_txt = f" / 업체ID {', '.join(sorted(map(str, ids)))[:80]}..." if ids else " / 전체"
         self.status.set(f"조회 조건 적용{range_txt}{ids_txt}")
 
+    # ---------- 엑셀 내보내기 ----------
     def export_excel(self):
         if self.last_filtered.empty:
-            messagebox.showwarning("경고","저장할 조회 결과가 없습니다. 먼저 [조회하기]를 실행해 주세요.")
+            messagebox.showwarning("경고","저장할 조회 결과가 없습니다. 먼저 [조회하기]를 실행해 주세요.", parent=self)
             return
 
         df = self.last_filtered.copy()
@@ -386,8 +503,9 @@ class ViewerApp(tk.Tk):
             autosize_excel(f)
         except:
             pass
-        messagebox.showinfo("완료", f"엑셀 저장 완료:\n{os.path.basename(f)}")
+        messagebox.showinfo("완료", f"엑셀 저장 완료:\n{os.path.basename(f)}", parent=self)
 
+    # ---------- 링크 오버레이/오픈 ----------
     def _on_tree_double_click(self, event):
         region = self.tree.identify("region", event.x, event.y)
         if region != "cell":
